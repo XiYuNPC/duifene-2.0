@@ -1,11 +1,9 @@
-# duifene_v2.py — 对分易自动签到助手
-# 用法: python duifene_v2.py
-
+# duifene_v2.py - 对分易自动签到助手
 import ctypes
 try: ctypes.windll.shcore.SetProcessDpiAwareness(1)
 except: pass
 
-import configparser, json, os, random, re, time, traceback
+import json, os, random, re, time, traceback, sys, configparser
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -16,32 +14,45 @@ from urllib3.util.retry import Retry
 import urllib3
 from bs4 import BeautifulSoup
 
-# ── 路径 ──
-import sys
 BASE_DIR = Path(sys._MEIPASS) if getattr(sys, 'frozen', False) else Path(__file__).parent
-USER_DIR = Path(sys.executable).parent if getattr(sys, 'frozen', False) else BASE_DIR
-CONFIG_FILE = USER_DIR / "duifenyi.ini"
-DEBUG_DIR = USER_DIR / "debug_logs"
-LOCATION_FILE = BASE_DIR / "locations.json"
+DEFAULT_LNG = "114.39437"
 
+# ── 持久化: Windows 用注册表, 其他平台用内存 ──
+import platform
+if platform.system() == "Windows":
+    import winreg
+    REG_KEY = r"Software\duifene"
+else:
+    REG_KEY = None
+
+def _reg_get(key, default=""):
+    if REG_KEY is None: return default
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_KEY) as k:
+            return winreg.QueryValueEx(k, key)[0]
+    except: return default
+
+def _reg_set(key, value):
+    if REG_KEY is None: return
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, REG_KEY) as k:
+            winreg.SetValueEx(k, key, 0, winreg.REG_SZ, value)
+    except: pass
+DEFAULT_LAT = "22.70462"
 urllib3.disable_warnings()
 
-# ── 会话 ──
 session = requests.Session()
 session.verify = False
 session.mount("https://", HTTPAdapter(max_retries=Retry(total=1, backoff_factor=0.5, status_forcelist=[429], allowed_methods=["GET","POST"]), pool_connections=1, pool_maxsize=2))
 session.mount("http://", HTTPAdapter(max_retries=Retry(total=1, backoff_factor=0.5), pool_connections=1, pool_maxsize=2))
 session.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0"
-
 HOST = "https://www.duifene.com"
 MOBILE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.40(0x1800282a) NetType/WIFI Language/zh_CN"
 
-# ── 配色 ──
 CB="#f5f6fa"; CC="#ffffff"; CPRI="#3867d6"; CSUC="#20bf6b"; CDAN="#eb3b5a"
 CTX="#2d3436"; CT2="#636e72"; CBO="#dfe6e9"; CLB="#1a1a2e"; CLF="#a4b0be"
 CWE="#07c160"; CWA="#fdcb6e"
 
-# ── 日志 ──
 class Log:
     def __init__(s): s._w = None; s._d = True
     def set(s, w): s._w = w
@@ -60,15 +71,39 @@ class Log:
         if s._d: s._p("DEBUG",m)
 log = Log()
 
-def get_coords(course_name):
-    try:
-        if LOCATION_FILE.exists():
-            locs = json.loads(LOCATION_FILE.read_text(encoding="utf-8"))
-            if course_name in locs: c = locs[course_name]; return c.get("lng",""), c.get("lat","")
-    except: pass
-    return "", ""
+class LocMgr:
+    """坐标管理器: 存于注册表/内存"""
+    @staticmethod
+    def load():
+        raw = _reg_get("locations", "{}")
+        try: return json.loads(raw)
+        except: return {}
 
-# ── 认证 ──
+    @staticmethod
+    def save(locs):
+        _reg_set("locations", json.dumps(locs, ensure_ascii=False))
+
+    @staticmethod
+    def sync(courses):
+        locs = LocMgr.load(); changed = False
+        for c in courses:
+            name = c.get("CourseName", "")
+            if not name or name in locs: continue
+            locs[name] = {"lng": DEFAULT_LNG, "lat": DEFAULT_LAT, "note": ""}
+            changed = True
+        if changed: LocMgr.save(locs)
+        return locs
+
+    @staticmethod
+    def get(name):
+        locs = LocMgr.load()
+        if name in locs:
+            c = locs[name]
+            lng = c.get("lng", "").strip()
+            lat = c.get("lat", "").strip()
+            if lng and lat: return lng, lat
+        return "", ""
+
 class Auth:
     @staticmethod
     def ok():
@@ -103,22 +138,20 @@ class Auth:
     @staticmethod
     def _save():
         ck = "; ".join(f"{k}={v}" for k,v in session.cookies.items())
-        config["INFO"] = {"cookie": ck}
-        with open(CONFIG_FILE, "w") as f: config.write(f)
+        log.d(f"保存Cookie: {ck[:80]}...")
+        _reg_set("cookie", ck)
         log.i("Cookie已保存")
 
     @staticmethod
     def load():
-        if not CONFIG_FILE.exists(): return False
+        ck = _reg_get("cookie", "")
+        if not ck or ck == "1=1": return False
         try:
-            config.read(CONFIG_FILE); ck = config.get("INFO","cookie",fallback="")
-            if not ck or ck == "1=1": return False
             for p in ck.split("; "):
                 if "=" in p: k,v = p.split("=",1); session.cookies[k]=v
             log.i("已加载本地Cookie"); return True
         except: return False
 
-# ── 课程 ──
 class Course:
     @staticmethod
     def list():
@@ -149,7 +182,6 @@ class Course:
             return None
         except: return None
 
-# ── 签到 API ──
 class CI:
     done = []
     _url = None; _data = None; _method = "POST"
@@ -180,9 +212,8 @@ class CI:
                 if not uid: uid = Course.uid()
         except: pass
         if not uid: log.e("无法获取学生ID"); return None
-
         h = {"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-             "Referer": "https://www.duifene.com/_CheckIn/PC/StudentNoCheckCount.aspx",
+             "Referer": f"{HOST}/_CheckIn/PC/StudentNoCheckCount.aspx",
              "X-Requested-With": "XMLHttpRequest", "Origin": "https://www.duifene.com",
              "Accept": "application/json, text/javascript, */*; q=0.01"}
         base = HOST + "/_CheckIn/MBCount.ashx"
@@ -286,29 +317,7 @@ class CI:
             return False, f"签到请求失败 HTTP {r.status_code}"
         except Exception as ex: return False, f"签到异常: {ex}"
 
-    @classmethod
-    def lc(cls, ci, cid):
-        orig_ua = session.headers.get("User-Agent","")
-        session.headers["User-Agent"] = MOBILE_UA
-        try:
-            url = f"{HOST}/_CheckIn/MB/TeachCheckIn.aspx?classid={cid}&temps=0&checktype=3&isrefresh=0&timeinterval=0&roomid=0&match="
-            r = session.get(url, timeout=10)
-            if r.status_code == 200:
-                soup = BeautifulSoup(r.text, "lxml")
-                lng = lat = None
-                for eid in ["HFRoomLongitude","hfroomlongitude"]:
-                    e = soup.find(id=eid)
-                    if e and e.get("value"): lng = e.get("value")
-                for eid in ["HFRoomLatitude","hfroomlatitude"]:
-                    e = soup.find(id=eid)
-                    if e and e.get("value"): lat = e.get("value")
-                if lng and lat: return lng, lat
-        except: pass
-        finally:
-            session.headers["User-Agent"] = orig_ua
-        return "", ""
 
-# ── 监控循环 ──
 class Loop:
     def __init__(s): s.r=False; s.ci=""; s.cn=""; s._rt=None; s._cid=""; s._delay=0; s._pending=None; s._tick=0
 
@@ -351,7 +360,6 @@ class Loop:
     def _do_pending(s):
         if s._pending:
             ct, p = s._pending; s._pending = None
-            cid = p.get("ID","")
             ok, msg = s._do(ct, p)
             if ok: log.ok(msg)
             elif "已结束" in msg or "没有正在" in msg: pass
@@ -371,16 +379,14 @@ class Loop:
         elif ct == "3":
             lng = info.get("Longitude","") or info.get("longitude","")
             lat = info.get("Latitude","") or info.get("latitude","")
-            if not lng or not lat: lng, lat = CI.lc(info.get("ID",""), s.ci)
-            if not lng or not lat: lng, lat = get_coords(s.cn)
-            if not lng or not lat: lng, lat = "114.39437", "22.70462"
+            if not lng or not lat: lng, lat = LocMgr.get(s.cn)
+            if not lng or not lat: lng, lat = DEFAULT_LNG, DEFAULT_LAT
             return CI.loc(uid, lng, lat, s._cid, s.ci)
         return False, f"未知签到类型: {ct}"
 
 config = configparser.ConfigParser()
 loop = Loop()
 
-# ── GUI ──
 class App:
     def __init__(s, rt):
         s.rt = rt; s.rt.title("对分易签到助手"); s.rt.configure(bg=CB)
@@ -406,18 +412,7 @@ class App:
         s._le.insert(0, "粘贴微信授权链接到这里..."); s._le.configure(fg=CT2)
         s._le.bind("<FocusIn>", lambda e: s._clr(s._le,"粘贴微信授权链接到这里...")); s._le.bind("<FocusOut>", lambda e: s._rst(s._le,"粘贴微信授权链接到这里..."))
         tk.Button(wf, text="微信登录", command=s._wx, font=("Microsoft YaHei UI",12,"bold"), bg=CWE, fg="white", relief=tk.FLAT, cursor="hand2", activebackground="#06ad56", activeforeground="white", padx=24, pady=6).pack(pady=4)
-
-        help_text = (
-            "使用说明:\n"
-            "1. 电脑微信打开以下链接并发送:\n"
-            "https://open.weixin.qq.com/connect/oauth2/authorize?appid=wx1b5650884f657981"
-            "&redirect_uri=https://www.duifene.com/_FileManage/PdfView.aspx"
-            "?file=https%3A%2F%2Ffs.duifene.com%2Fres%2Fr2%2Fu6106199%2F"
-            "%E5%AF%B9%E5%88%86%E6%98%93%E7%99%BB%E5%BD%95_876c9d439ca68ead389c.pdf"
-            "&response_type=code&scope=snsapi_userinfo&connect_redirect=1#wechat_redirect\n\n"
-            "2. 点击进入链接，右上角 ... → 复制链接\n"
-            "3. 粘贴到上方输入框，点击登录"
-        )
+        help_text = ("使用说明:\n1. 电脑微信打开以下链接并发送:\nhttps://open.weixin.qq.com/connect/oauth2/authorize?appid=wx1b5650884f657981&redirect_uri=https://www.duifene.com/_FileManage/PdfView.aspx?file=https%3A%2F%2Ffs.duifene.com%2Fres%2Fr2%2Fu6106199%2F%E5%AF%B9%E5%88%86%E6%98%93%E7%99%BB%E5%BD%95_876c9d439ca68ead389c.pdf&response_type=code&scope=snsapi_userinfo&connect_redirect=1#wechat_redirect\n\n2. 点击进入链接，右上角 ... → 复制链接\n3. 粘贴到上方输入框，点击登录")
         ht = tk.Text(wf, font=("Microsoft YaHei UI",9), bg=CC, fg=CT2, relief=tk.FLAT, height=7, wrap=tk.WORD, borderwidth=0, cursor="arrow")
         ht.insert("1.0", help_text); ht.configure(state=tk.DISABLED); ht.pack(fill=tk.X, pady=(8,0))
 
@@ -427,6 +422,11 @@ class App:
             tk.Label(pf, text=lb, font=("Microsoft YaHei UI",11,"bold"), bg=CC, fg=CTX).pack(anchor=tk.W, pady=(8,2))
             en = tk.Entry(pf, font=("Microsoft YaHei UI",12), show=sh, relief=tk.FLAT, bg="#f1f2f6", insertbackground=CPRI); en.pack(fill=tk.X, ipady=6); setattr(s, vn, en)
         tk.Button(pf, text="登录", command=s._pwd, font=("Microsoft YaHei UI",12,"bold"), bg=CPRI, fg="white", relief=tk.FLAT, cursor="hand2", activebackground="#2751c0", activeforeground="white", padx=24, pady=6).pack(pady=(10,4))
+
+        btn_frame = tk.Frame(lc, bg=CC); btn_frame.pack(fill=tk.X, pady=(8,0))
+        tk.Button(btn_frame, text="坐标管理", command=s._open_coord_window,
+                  font=("Microsoft YaHei UI",11,"bold"), bg="#6c5ce7", fg="white",
+                  relief=tk.FLAT, cursor="hand2", padx=20, pady=6).pack()
 
         df = tk.Frame(lc, bg=CC); df.pack(fill=tk.X, pady=(10,0))
         tk.Label(df, text="签到延迟（检测到后等待N秒再签，0=立即）", font=("Microsoft YaHei UI",10), bg=CC, fg=CT2).pack(anchor=tk.W)
@@ -451,6 +451,62 @@ class App:
         for t, c in [("info","#74b9ff"),("ok","#00b894"),("warn","#fdcb6e"),("error","#ff7675"),("debug","#636e72")]: s._lb.tag_configure(t, foreground=c)
         log.set(s._lb)
 
+    def _open_coord_window(s):
+        win = tk.Toplevel(s.rt)
+        win.title("坐标管理")
+        win.geometry("720x520")
+        win.configure(bg=CB)
+        win.transient(s.rt)
+        win.grab_set()
+        tk.Label(win, text="课程定位坐标管理", font=("Microsoft YaHei UI",14,"bold"), bg=CB, fg=CTX).pack(pady=(16,8))
+        tk.Label(win, text="修改后点击保存, 未配置的课程使用默认C5教学楼坐标", font=("Microsoft YaHei UI",9), bg=CB, fg=CT2).pack()
+
+        canvas = tk.Canvas(win, bg=CB, highlightthickness=0)
+        scrollbar = tk.Scrollbar(win, orient=tk.VERTICAL, command=canvas.yview)
+        frame = tk.Frame(canvas, bg=CB)
+        frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0,0), window=frame, anchor=tk.NW)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=16, pady=(0,16))
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _on_mousewheel(e): canvas.yview_scroll(-1*(e.delta//120), "units")
+        win.bind_all("<MouseWheel>", _on_mousewheel, "+")
+        win.bind("<Destroy>", lambda e: win.unbind_all("<MouseWheel>"))
+
+        locs = LocMgr.load()
+        widgets = {}
+        row = 0
+        headers = [("课程",28), ("经度",14), ("纬度",14), ("备注",18)]
+        for ci, (hdr, w) in enumerate(headers):
+            tk.Label(frame, text=hdr, font=("Microsoft YaHei UI",10,"bold"), bg=CB, fg=CTX, width=w, anchor=tk.W if ci==0 else tk.CENTER).grid(row=row, column=ci, padx=3, pady=3)
+        row += 1
+        for c in s._cs:
+            name = c.get("CourseName","")
+            if not name: continue
+            loc = locs.get(name, {"lng":"","lat":"","note":""})
+            tk.Label(frame, text=name, font=("Microsoft YaHei UI",10), bg=CC, anchor=tk.W, width=28).grid(row=row, column=0, padx=3, pady=1, sticky=tk.W)
+            le = tk.Entry(frame, font=("Microsoft YaHei UI",10), relief=tk.FLAT, bg="#f1f2f6", width=14, insertbackground=CPRI)
+            le.insert(0, loc.get("lng","")); le.grid(row=row, column=1, padx=3)
+            ae = tk.Entry(frame, font=("Microsoft YaHei UI",10), relief=tk.FLAT, bg="#f1f2f6", width=14, insertbackground=CPRI)
+            ae.insert(0, loc.get("lat","")); ae.grid(row=row, column=2, padx=3)
+            ne = tk.Entry(frame, font=("Microsoft YaHei UI",10), relief=tk.FLAT, bg="#f1f2f6", width=18, insertbackground=CPRI)
+            ne.insert(0, loc.get("note","")); ne.grid(row=row, column=3, padx=3)
+            widgets[name] = (le, ae, ne)
+            row += 1
+
+        def save_all():
+            locs = LocMgr.load()
+            for name, (le, ae, ne) in widgets.items():
+                lng = le.get().strip() or DEFAULT_LNG
+                lat = ae.get().strip() or DEFAULT_LAT
+                note = ne.get().strip()
+                locs[name] = {"lng": lng, "lat": lat, "note": note}
+            LocMgr.save(locs)
+            messagebox.showinfo("提示", "坐标已保存", parent=win)
+        tk.Button(frame, text="保存全部", command=save_all, font=("Microsoft YaHei UI",11,"bold"), bg=CSUC, fg="white",
+                  relief=tk.FLAT, cursor="hand2", padx=24, pady=8).grid(row=row+1, column=0, columnspan=4, pady=(16,0))
+
     def _clr(s, e, ph):
         if e.get()==ph: e.delete(0,tk.END); e.configure(fg=CTX)
     def _rst(s, e, ph):
@@ -458,15 +514,13 @@ class App:
     def _st(s, tx, cl): s._sv.set(tx); s._sl.configure(fg=cl)
 
     def _init(s):
-        if not CONFIG_FILE.exists():
-            config["INFO"]={"cookie":"1=1"}
-            with open(CONFIG_FILE,"w") as f: config.write(f)
-            try: session.get(HOST, timeout=10)
-            except: log.w("无法连接对分易"); return
         if Auth.load():
             if Auth.ok(): s._rf()
             else: log.i("Cookie过期，请重新登录")
-        else: log.i("未找到Cookie，请登录")
+        else:
+            try: session.get(HOST, timeout=10)
+            except: log.w("无法连接对分易")
+            log.i("未找到Cookie，请登录")
 
     def _wx(s):
         lnk = s._le.get().strip()
@@ -488,6 +542,7 @@ class App:
             s._cs=cs; s._co["values"]=tuple(c.get("CourseName","未知") for c in cs)
             if cs: s._co.set(cs[0].get("CourseName",""))
             s._sb.configure(state=tk.NORMAL); s._st(f"已加载 {len(cs)} 门课程", CSUC)
+            LocMgr.sync(cs)
         else: s._st("获取课程失败", CDAN)
 
     def _go(s):
