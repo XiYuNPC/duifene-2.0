@@ -172,7 +172,8 @@ class Course:
         try:
             r = session.get(HOST+"/_UserCenter/MB/index.aspx", timeout=10)
             if r.status_code != 200: return None
-            soup = BeautifulSoup(r.text, "lxml")
+            #soup = BeautifulSoup(r.text, "lxml")
+            soup = BeautifulSoup(r.text, "html.parser")
             for eid in ["hidUID","hidUid","hidUserId","hidSID","studentId"]:
                 e = soup.find(id=eid)
                 if e and e.get("value"): return e.get("value")
@@ -201,7 +202,8 @@ class CI:
         try:
             r = session.get(page_url, timeout=10)
             if r.status_code == 200:
-                soup = BeautifulSoup(r.text, "lxml")
+                #soup = BeautifulSoup(r.text, "lxml")
+                soup = BeautifulSoup(r.text, "html.parser")
                 for eid in ["hidUID","hidUid","hidUserId","hidSID","studentId","HidStudentID"]:
                     e = soup.find(id=eid)
                     if e and e.get("value"): uid = e.get("value"); break
@@ -285,7 +287,8 @@ class CI:
         try:
             r = session.get(f"{HOST}/_CheckIn/MB/QrCodeCheckOK.aspx?state={ci}", timeout=10)
             if r.status_code != 200: return False, f"二维码请求失败 HTTP {r.status_code}"
-            soup = BeautifulSoup(r.text, "lxml")
+            #soup = BeautifulSoup(r.text, "lxml")
+            soup = BeautifulSoup(r.text, "html.parser")
             for eid in ["DivOK","divok","divOK"]:
                 e = soup.find(id=eid)
                 if e and "签到成功" in e.get_text(): return True, "签到成功"
